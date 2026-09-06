@@ -1,7 +1,7 @@
-const CACHE_NAME = "la-laguna-en-v2";
+const CACHE_NAME = "la-laguna-en-v4";
 
 const ASSETS = [
-  "./",
+"./",
   "./index.html",
   "./la-laguna.geojson",
   "./manifest.json",
@@ -12,7 +12,7 @@ const ASSETS = [
 ];
 
 const AUDIO_URLS = [
-  "https://xzymbvnljudyypdyuisf.supabase.co/storage/v1/object/public/la-laguna_en/0.mp3",
+"https://xzymbvnljudyypdyuisf.supabase.co/storage/v1/object/public/la-laguna_en/0.mp3",
   "https://xzymbvnljudyypdyuisf.supabase.co/storage/v1/object/public/la-laguna_en/1.mp3",
   "https://xzymbvnljudyypdyuisf.supabase.co/storage/v1/object/public/la-laguna_en/2.mp3",
   "https://xzymbvnljudyypdyuisf.supabase.co/storage/v1/object/public/la-laguna_en/3.mp3",
@@ -283,58 +283,120 @@ const TILES = [
   "./tiles/17/59597/54711.png"
 ];
 
-const ALL_RESOURCES = [...ASSETS, ...AUDIO_URLS, ...TILES];
-
-self.addEventListener("install", event => {
+// 1. INSTALL: Pre-cache static assets and all audio files for offline use
+self.addEventListener("install", (e) => {
   self.skipWaiting();
-  event.waitUntil(
-    caches.open(CACHE_NAME).then(cache => {
-      return Promise.allSettled(
-        ALL_RESOURCES.map(url => {
-          return cache.add(url).catch(err => {
-            console.warn(`Failed to cache on install: ${url} - ${err.message}`);
-          });
-        })
-      );
+  e.waitUntil(
+    caches.open(CACHE_NAME).then(async (cache) => {
+      console.log("[SW] Pre-caching assets and audio for offline...");
+      await cache.addAll(ASSETS).catch(err => console.warn("[SW] Asset pre-cache warning:", err));
+      
+      // Pre-fetch all audio files with clean GET requests (no range header) to ensure 200 OK status
+      for (const url of AUDIO_URLS) {
+        try {
+          const req = new Request(url, { method: "GET" });
+          const res = await fetch(req);
+          if (res && res.status === 200) {
+            await cache.put(url, res);
+          }
+        } catch (err) {
+          console.warn("[SW] Audio pre-cache warning for:", url, err);
+        }
+      }
+
+      // Pre-cache tiles if available
+      if (TILES.length > 0) {
+        await cache.addAll(TILES).catch(err => console.warn("[SW] Tiles pre-cache warning:", err));
+      }
     })
   );
 });
 
-self.addEventListener("activate", event => {
-  event.waitUntil(
-    caches.keys().then(keys => {
-      return Promise.all(
-        keys.map(key => {
-          if (key !== CACHE_NAME) {
-            return caches.delete(key);
-          }
+// 2. ACTIVATE: Clean old caches & claim clients
+self.addEventListener("activate", (e) => {
+  e.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys.map((key) => {
+          if (key !== CACHE_NAME) return caches.delete(key);
         })
-      );
-    }).then(() => self.clients.claim())
+      )
+    ).then(() => self.clients.claim())
   );
 });
 
-self.addEventListener("fetch", event => {
-  event.respondWith(
-    caches.match(event.request).then(cachedResponse => {
-      if (cachedResponse) {
-        return cachedResponse;
-      }
-      return fetch(event.request).then(networkResponse => {
-        if (!networkResponse || networkResponse.status !== 200) {
-          return networkResponse;
+// 3. FETCH: Smart Cache & HTTP Range Request handler for HTML5 <audio> offline playback
+self.addEventListener("fetch", (e) => {
+  const url = e.request.url;
+
+  // Intercept audio requests (MP3s) or Supabase audio storage URLs
+  if (url.endsWith(".mp3") || url.includes("supabase.co/storage/v1/object/public/")) {
+    e.respondWith(handleAudioFetch(e.request));
+    return;
+  }
+
+  // Standard static assets & tiles
+  e.respondWith(
+    caches.match(e.request).then((cachedRes) => {
+      if (cachedRes) return cachedRes;
+      return fetch(e.request).then((netRes) => {
+        if (!netRes || netRes.status !== 200) {
+          return netRes;
         }
-        const url = event.request.url;
-        if (url.startsWith(self.location.origin) || url.includes("supabase.co") || url.includes("unpkg.com")) {
-          const responseToCache = networkResponse.clone();
-          caches.open(CACHE_NAME).then(cache => {
-            cache.put(event.request, responseToCache);
-          });
+        const resToCache = netRes.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(e.request, resToCache));
+        return netRes;
+      }).catch(() => {
+        if (e.request.mode === "navigate") {
+          return caches.match("./index.html");
         }
-        return networkResponse;
-      }).catch(err => {
-        console.error("Fetch error:", err);
       });
     })
   );
 });
+
+// Helper: Handle HTTP Range Requests for cached audio files (iOS Safari & Android Chrome)
+async function handleAudioFetch(request) {
+  const cache = await caches.open(CACHE_NAME);
+  let response = await cache.match(request.url);
+
+  // If not cached yet, fetch online with clean GET
+  if (!response) {
+    try {
+      const cleanReq = new Request(request.url, { method: "GET" });
+      const netRes = await fetch(cleanReq);
+      if (netRes && netRes.status === 200) {
+        await cache.put(request.url, netRes.clone());
+        response = netRes;
+      } else {
+        return netRes;
+      }
+    } catch (err) {
+      console.error("[SW] Audio offline & not cached:", request.url);
+      return new Response("Audio offline not available", { status: 503 });
+    }
+  }
+
+  // Handle Range Header for HTML5 <audio>
+  const rangeHeader = request.headers.get("range");
+  if (rangeHeader && response) {
+    const arrayBuffer = await response.clone().arrayBuffer();
+    const bytes = rangeHeader.replace(/bytes=/, "").split("-");
+    const start = parseInt(bytes[0], 10) || 0;
+    const end = bytes[1] ? parseInt(bytes[1], 10) : arrayBuffer.byteLength - 1;
+    const chunk = arrayBuffer.slice(start, end + 1);
+
+    return new Response(chunk, {
+      status: 206,
+      statusText: "Partial Content",
+      headers: new Headers({
+        "Content-Range": `bytes ${start}-${end}/${arrayBuffer.byteLength}`,
+        "Content-Length": chunk.byteLength,
+        "Content-Type": "audio/mpeg",
+        "Accept-Ranges": "bytes"
+      })
+    });
+  }
+
+  return response;
+}
